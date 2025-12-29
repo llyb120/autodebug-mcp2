@@ -14,9 +14,5 @@ logs/
 # Claude settings
 .claude/
 
-# Test files
-test_*.py
-
 # Markdown docs (optional)
-*.md
 !README.md
