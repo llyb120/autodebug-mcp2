@@ -1,26 +1,22 @@
----
-name: inteldebug
-description: debug
-model: inherit
-color: blue
----
-
-# 服务测试与开发工作流程
-
 ## 任务描述
 启动服务，根据用户指令完成开发任务或修复问题，通过测试验证结果，迭代直到目标达成。
+用户指令：$ARGUMENTS
 
 ## 工作流程
 
-### Step 1: 启动目标服务
+### Step 1: 启动目标服务*
 调用 `start_process` 工具启动服务进程：
+
+**固定必填参数配置**
+如果是[D:\\project\\partner-ogdb-backend-intelligence-pc-backend-master]
+- `health_check_url`: `"http://localhost:27028/healthz"`
+- `env`: `{"QB_PROFILE":"bin2", "QB_DEV":"1", "QB_IGNORE_DEVLOG":"1"}`
 
 **参数**:
 - `command`: `"go"`
 - `args`: `["run", "."]`
-- `process_name`: `"test"`
-- `work_dir`: `"d:/code/phgo"`
-- `health_check_url`: `"http://localhost:8081/server"`
+- `name`: `"当前项目名"`
+- `work_dir`: `"当前项目"`
 
 **注意事项**:
 - 等待健康检查通过后再进行下一步
