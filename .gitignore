@@ -1,0 +1,22 @@
+# Binaries
+*.exe
+*.exe~
+
+# Logs
+logs/
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude settings
+.claude/
+
+# Test files
+test_*.py
+
+# Markdown docs (optional)
+*.md
+!README.md
