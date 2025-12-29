@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -307,30 +309,57 @@ func RegisterTools(server *mcp.Server) {
 		if processInfo != nil {
 			// 使用时间窗口获取日志（包含请求前100ms到请求后500ms的日志）
 			requestLogs = processInfo.GetRequestLog(requestStartTime)
-			logger.Debug("使用时间窗口获取请求日志，长度: %d", len(requestLogs))
-
-			// 如果日志太长，截取
-			if len(requestLogs) > 5000 {
-				requestLogs = "...(日志过长，已截取)...\n" + requestLogs[len(requestLogs)-5000:]
-			}
 		}
 
-		// 构建响应文本
-		responseText := fmt.Sprintf("请求完成\n方法: %s\nURL: %s\n状态码: %d\n耗时: %v\n\n响应:\n%s",
-			method, fullURL, statusCode, duration, responseBody)
+		// 每次请求都写入日志文件（不在主日志中输出请求期间的进程日志）
+		logFilePath := writeResponseToFile(method, fullURL, statusCode, duration, responseBody, requestLogs)
 
-		if processInfo != nil && requestLogs != "" {
-			responseText += fmt.Sprintf("\n\n请求期间进程日志:\n%s", requestLogs)
-		}
+		// 计算总内容长度，决定是返回完整内容还是只返回文件路径
+		totalContentLen := len(responseBody) + len(requestLogs)
+		const maxInlineLen = 4000 // 超过4000字符就只返回文件路径
 
-		// 构建结构化响应
+		var responseText string
 		structuredResp := map[string]any{
 			"status_code": statusCode,
 			"duration_ms": duration.Milliseconds(),
-			"response":    responseBody,
 		}
-		if processInfo != nil {
-			structuredResp["logs"] = requestLogs
+
+		if logFilePath != "" {
+			structuredResp["log_file"] = logFilePath
+		}
+
+		if totalContentLen > maxInlineLen && logFilePath != "" {
+			// 内容过长，只返回文件路径和摘要
+			logger.Info("响应内容过长(%d字符)，完整内容见: %s", totalContentLen, logFilePath)
+
+			// 构建简短的响应摘要
+			responseSummary := responseBody
+			if len(responseSummary) > 500 {
+				responseSummary = responseSummary[:500] + "\n...(已截取)..."
+			}
+
+			responseText = fmt.Sprintf("请求完成\n方法: %s\nURL: %s\n状态码: %d\n耗时: %v\n\n⚠️ 内容过长，完整响应和日志已保存到:\n%s\n\n响应摘要:\n%s",
+				method, fullURL, statusCode, duration, logFilePath, responseSummary)
+
+			structuredResp["response_summary"] = truncateString(responseBody, 500)
+			if processInfo != nil && requestLogs != "" {
+				structuredResp["logs_summary"] = truncateString(requestLogs, 500)
+			}
+		} else {
+			// 内容不长，返回完整内容（同时也告知日志文件位置）
+			responseText = fmt.Sprintf("请求完成\n方法: %s\nURL: %s\n状态码: %d\n耗时: %v\n\n响应:\n%s",
+				method, fullURL, statusCode, duration, responseBody)
+			if processInfo != nil && requestLogs != "" {
+				responseText += fmt.Sprintf("\n\n请求期间进程日志:\n%s", requestLogs)
+			}
+			if logFilePath != "" {
+				responseText += fmt.Sprintf("\n\n(完整日志已保存: %s)", logFilePath)
+			}
+
+			structuredResp["response"] = responseBody
+			if processInfo != nil {
+				structuredResp["logs"] = requestLogs
+			}
 		}
 
 		return &mcp.CallToolResult{
@@ -429,6 +458,72 @@ func RegisterTools(server *mcp.Server) {
 			IsError: true,
 		}, nil, nil
 	})
+}
+
+// truncateString 截断字符串到指定长度
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// writeResponseToFile 将响应内容写入logs目录下的文件，返回文件路径
+func writeResponseToFile(method, url string, statusCode int, duration time.Duration, responseBody, logs string) string {
+	logger := GetLogger()
+
+	// 获取可执行文件所在目录
+	execPath, err := os.Executable()
+	if err != nil {
+		logger.Error("获取可执行文件路径失败: %v", err)
+		return ""
+	}
+	execDir := filepath.Dir(execPath)
+	logsDir := filepath.Join(execDir, "logs")
+
+	// 确保logs目录存在
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		logger.Error("创建logs目录失败: %v", err)
+		return ""
+	}
+
+	// 生成文件名：response_YYYYMMDD_HHMMSS_毫秒.log
+	timestamp := time.Now().Format("20060102_150405")
+	ms := time.Now().UnixMilli() % 1000
+	filename := fmt.Sprintf("response_%s_%03d.log", timestamp, ms)
+	filePath := filepath.Join(logsDir, filename)
+
+	// 构建文件内容
+	var content strings.Builder
+	content.WriteString("========================================\n")
+	content.WriteString("HTTP 请求响应日志\n")
+	content.WriteString("========================================\n")
+	content.WriteString(fmt.Sprintf("时间: %s\n", time.Now().Format(time.RFC3339)))
+	content.WriteString(fmt.Sprintf("方法: %s\n", method))
+	content.WriteString(fmt.Sprintf("URL: %s\n", url))
+	content.WriteString(fmt.Sprintf("状态码: %d\n", statusCode))
+	content.WriteString(fmt.Sprintf("耗时: %v\n", duration))
+	content.WriteString("\n========================================\n")
+	content.WriteString("响应内容\n")
+	content.WriteString("========================================\n")
+	content.WriteString(responseBody)
+	content.WriteString("\n")
+
+	if logs != "" {
+		content.WriteString("\n========================================\n")
+		content.WriteString("进程日志\n")
+		content.WriteString("========================================\n")
+		content.WriteString(logs)
+		content.WriteString("\n")
+	}
+
+	// 写入文件
+	if err := os.WriteFile(filePath, []byte(content.String()), 0644); err != nil {
+		logger.Error("写入响应日志文件失败: %v", err)
+		return ""
+	}
+
+	return filePath
 }
 
 // waitForHTTPReady 等待 HTTP 服务就绪（防止 channel 泄漏）
