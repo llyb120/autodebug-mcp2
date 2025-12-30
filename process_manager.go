@@ -381,6 +381,110 @@ func (pm *ProcessManager) GetProcess(name string) (*ProcessInfo, bool) {
 	return val.(*ProcessInfo), true
 }
 
+// FindProcessByURL 根据 URL 自动查找匹配的进程
+// 通过 host:端口匹配进程的 HealthCheckURL 或 HealthCheckPort
+// 支持 localhost/127.0.0.1/::1 等价匹配
+func (pm *ProcessManager) FindProcessByURL(requestURL string) *ProcessInfo {
+	logger := GetLogger()
+
+	// 解析请求 URL
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil {
+		logger.Debug("解析请求URL失败: %v", err)
+		return nil
+	}
+
+	// 提取请求的 host 和端口
+	requestHost := parsedURL.Hostname()
+	requestPort := parsedURL.Port()
+
+	// 标准化请求的 host（处理 localhost/127.0.0.1 等价）
+	normalizedRequestHost := normalizeHost(requestHost)
+
+	// 如果没有显式指定端口，使用默认端口
+	if requestPort == "" {
+		if parsedURL.Scheme == "http" {
+			requestPort = "80"
+		} else if parsedURL.Scheme == "https" {
+			requestPort = "443"
+		} else {
+			logger.Debug("无法确定默认端口，scheme: %s", parsedURL.Scheme)
+			return nil
+		}
+	}
+
+	logger.Debug("查找进程: requestHost=%s (normalized=%s), requestPort=%s", requestHost, normalizedRequestHost, requestPort)
+
+	var matchedProcess *ProcessInfo
+
+	// 遍历所有进程，查找匹配的
+	pm.processes.Range(func(key, value any) bool {
+		info := value.(*ProcessInfo)
+
+		// 方法1: 直接比较 HealthCheckURL
+		if info.HealthCheckURL != "" {
+			healthURL, err := url.Parse(info.HealthCheckURL)
+			if err == nil {
+				// 标准化健康检查的 host
+				normalizedHealthHost := normalizeHost(healthURL.Hostname())
+				healthPort := healthURL.Port()
+
+				// 使用默认端口
+				if healthPort == "" {
+					if healthURL.Scheme == "http" {
+						healthPort = "80"
+					} else if healthURL.Scheme == "https" {
+						healthPort = "443"
+					}
+				}
+
+				// 比较 host 和端口
+				if normalizedRequestHost == normalizedHealthHost && requestPort == healthPort {
+					logger.Debug("通过 HealthCheckURL 匹配到进程 %s", info.Name)
+					matchedProcess = info
+					return false // 停止遍历
+				}
+			}
+		}
+
+		// 方法2: 比较 HealthCheckPort（将请求的端口转为整数）
+		if info.HealthCheckPort > 0 {
+			requestPortInt, _ := strconv.Atoi(requestPort)
+			if requestPortInt == info.HealthCheckPort {
+				logger.Debug("通过 HealthCheckPort 匹配到进程 %s", info.Name)
+				matchedProcess = info
+				return false // 停止遍历
+			}
+		}
+
+		return true // 继续遍历
+	})
+
+	if matchedProcess != nil {
+		logger.Info("自动关联进程: %s <- %s", matchedProcess.Name, requestURL)
+	}
+
+	return matchedProcess
+}
+
+// normalizeHost 标准化主机名，处理 localhost/127.0.0.1/::1 等价
+func normalizeHost(host string) string {
+	if host == "" {
+		return ""
+	}
+
+	// 转为小写
+	host = strings.ToLower(host)
+
+	// 处理各种 localhost 变体
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+		return "localhost"
+	}
+
+	return host
+}
+
 // StartRequestLog 标记请求开始时间（完全无锁）
 func (pi *ProcessInfo) StartRequestLog() time.Time {
 	return time.Now()
@@ -394,7 +498,11 @@ func (pi *ProcessInfo) GetRequestLog(startTime time.Time) string {
 
 	endTime := time.Now().Add(500 * time.Millisecond) // 包含请求后500ms的日志
 
+	logger := GetLogger()
+	logger.Debug("GetRequestLog: 开始时间=%v, 结束时间=%v", startTime.Format("15:04:05.000"), endTime.Format("15:04:05.000"))
+
 	var logs []string
+	matchCount := 0
 	// 遍历环形缓冲区
 	for i := 0; i < pi.maxLogLines; i++ {
 		idx := (pi.logIndex - 1 - i + pi.maxLogLines) % pi.maxLogLines
@@ -405,18 +513,21 @@ func (pi *ProcessInfo) GetRequestLog(startTime time.Time) string {
 			continue
 		}
 
-		// 检查是否在时间窗口内
-		if logTime.After(startTime.Add(-100*time.Millisecond)) && logTime.Before(endTime) {
+		// 检查是否在时间窗口内（扩大窗口：请求前1秒到请求后500ms）
+		if logTime.After(startTime.Add(-1*time.Second)) && logTime.Before(endTime) {
 			logs = append([]string{pi.logLines[idx]}, logs...) // 保持时间顺序
+			matchCount++
 		}
 
 		// 如果日志时间早于开始时间太多，停止遍历
-		if logTime.Before(startTime.Add(-1 * time.Second)) {
+		if logTime.Before(startTime.Add(-2 * time.Second)) {
 			break
 		}
 	}
 
-	return strings.Join(logs, "\n")
+	result := strings.Join(logs, "\n")
+	logger.Debug("GetRequestLog: 找到 %d 条匹配日志，总长度 %d", matchCount, len(result))
+	return result
 }
 
 // KillProcess 终止进程
@@ -730,4 +841,3 @@ func waitForPortReadyWithExitCheck(port int, timeout time.Duration, exitChan <-c
 		}
 	}
 }
-

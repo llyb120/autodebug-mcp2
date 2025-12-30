@@ -187,12 +187,27 @@ func RegisterTools(server *mcp.Server) {
 					IsError: true,
 				}, nil, nil
 			}
+		} else {
+			// 没有指定进程名，尝试通过 URL 自动关联
+			// 首先构建完整的请求 URL
+			var fullURL string
+			if strings.HasPrefix(args.URL, "http://") || strings.HasPrefix(args.URL, "https://") {
+				fullURL = args.URL
+			} else {
+				// 如果不是完整 URL，无法自动关联
+				fullURL = args.URL
+			}
+
+			// 尝试通过 URL 查找匹配的进程
+			if strings.HasPrefix(fullURL, "http://") || strings.HasPrefix(fullURL, "https://") {
+				processInfo = processManager.FindProcessByURL(fullURL)
+			}
 		}
 
 		// 构建最终的URL
 		var fullURL string
-		if args.ProcessName != "" && processInfo != nil && processInfo.HealthCheckURL != "" {
-			// 如果指定了进程名，从健康检查URL中提取scheme和host:port
+		if processInfo != nil && processInfo.HealthCheckURL != "" {
+			// 如果关联到了进程（通过名称或自动关联），从健康检查URL中提取scheme和host:port
 			parsedHealthURL, err := url.Parse(processInfo.HealthCheckURL)
 			if err != nil {
 				return &mcp.CallToolResult{
@@ -230,9 +245,13 @@ func RegisterTools(server *mcp.Server) {
 				fullURL = baseURL + path
 			}
 
-			logger.Info("使用进程 %s 的地址: %s", args.ProcessName, fullURL)
+			if args.ProcessName != "" {
+				logger.Info("使用进程 %s 的地址: %s", args.ProcessName, fullURL)
+			} else {
+				logger.Info("使用自动关联进程 %s 的地址: %s", processInfo.Name, fullURL)
+			}
 		} else {
-			// 没有指定进程名，直接使用用户提供的URL
+			// 没有关联进程，直接使用用户提供的URL
 			fullURL = args.URL
 		}
 
@@ -307,11 +326,17 @@ func RegisterTools(server *mcp.Server) {
 		// 获取请求期间的日志（使用时间窗口，无需等待）
 		var requestLogs string
 		if processInfo != nil {
-			// 使用时间窗口获取日志（包含请求前100ms到请求后500ms的日志）
+			// 使用时间窗口获取日志（包含请求前1秒到请求后500ms的日志）
 			requestLogs = processInfo.GetRequestLog(requestStartTime)
+			if requestLogs == "" {
+				requestLogs = "(请求期间无进程日志输出)"
+				logger.Debug("请求期间未捕获到进程日志")
+			}
+		} else {
+			requestLogs = "(未关联进程)"
 		}
 
-		// 每次请求都写入日志文件（不在主日志中输出请求期间的进程日志）
+		// 每次请求都写入日志文件（包含请求期间的进程日志）
 		logFilePath := writeResponseToFile(method, fullURL, statusCode, duration, responseBody, requestLogs)
 
 		// 计算总内容长度，决定是返回完整内容还是只返回文件路径
@@ -352,9 +377,9 @@ func RegisterTools(server *mcp.Server) {
 			if processInfo != nil && requestLogs != "" {
 				responseText += fmt.Sprintf("\n\n请求期间进程日志:\n%s", requestLogs)
 			}
-			if logFilePath != "" {
-				responseText += fmt.Sprintf("\n\n(完整日志已保存: %s)", logFilePath)
-			}
+			// if logFilePath != "" {
+			// 	responseText += fmt.Sprintf("\n\n(完整日志已保存: %s)", logFilePath)
+			// }
 
 			structuredResp["response"] = responseBody
 			if processInfo != nil {
@@ -509,13 +534,16 @@ func writeResponseToFile(method, url string, statusCode int, duration time.Durat
 	content.WriteString(responseBody)
 	content.WriteString("\n")
 
+	// 始终写入进程日志部分（即使是空或者占位符）
+	content.WriteString("\n========================================\n")
+	content.WriteString("进程日志\n")
+	content.WriteString("========================================\n")
 	if logs != "" {
-		content.WriteString("\n========================================\n")
-		content.WriteString("进程日志\n")
-		content.WriteString("========================================\n")
 		content.WriteString(logs)
-		content.WriteString("\n")
+	} else {
+		content.WriteString("(无进程日志)")
 	}
+	content.WriteString("\n")
 
 	// 写入文件
 	if err := os.WriteFile(filePath, []byte(content.String()), 0644); err != nil {
