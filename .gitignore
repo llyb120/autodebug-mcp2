@@ -5,6 +5,9 @@
 # Logs
 logs/
 
+# mems
+mems/
+
 # IDE and editor
 .idea/
 .vscode/
