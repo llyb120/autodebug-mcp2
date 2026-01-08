@@ -685,6 +685,394 @@ func RegisterTools(server *mcp.Server) {
 			},
 		}, nil, nil
 	})
+
+	// 注册 save_knowledge 工具：保存或更新知识到知识库
+	type saveKnowledgeArgs struct {
+		Title       string   `json:"title" jsonschema:"知识标题，简短描述这条知识的主题"`
+		Content     string   `json:"content" jsonschema:"知识内容，详细的知识描述"`
+		Tags        []string `json:"tags,omitempty" jsonschema:"标签列表，用于分类和检索"`
+		Category    string   `json:"category,omitempty" jsonschema:"分类，如: 代码规范、API文档、问题解决、最佳实践等"`
+		KnowledgeID string   `json:"knowledge_id,omitempty" jsonschema:"知识ID（可选），如果提供则更新现有知识，否则创建新知识"`
+		WorkDir     string   `json:"work_dir" jsonschema:"工作目录，知识库将保存在该目录下的 .knowledge 文件夹中"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "save_knowledge",
+		Description: "保存或更新知识到知识库。用于积累和保存可复用的知识，如代码规范、问题解决方案、API文档、最佳实践等。支持标签和分类，便于后续检索。知识库保存在工作目录的 .knowledge 文件夹中。如果提供 knowledge_id 则更新现有知识，否则创建新知识。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args saveKnowledgeArgs) (*mcp.CallToolResult, any, error) {
+		// 获取工具执行权限，确保工具串行执行
+		acquireToolSemaphore()
+		defer releaseToolSemaphore()
+
+		logger.Info("=== 保存知识 ===")
+
+		if args.Title == "" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "参数错误：title 不能为空"},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		if args.Content == "" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "参数错误：content 不能为空"},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		if args.WorkDir == "" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "参数错误：work_dir 不能为空，请提供工作目录路径"},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		// 使用工作目录下的 .knowledge 文件夹
+		knowledgeDir := filepath.Join(args.WorkDir, ".knowledge")
+
+		// 确保knowledge目录存在
+		if err := os.MkdirAll(knowledgeDir, 0755); err != nil {
+			logger.Error("创建knowledge目录失败: %v", err)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("保存知识失败: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		// 确定知识ID和文件路径
+		var knowledgeID string
+		var filePath string
+		isUpdate := false
+		var createdTime string
+
+		if args.KnowledgeID != "" {
+			// 使用提供的知识ID（更新模式）
+			knowledgeID = args.KnowledgeID
+			filename := fmt.Sprintf("%s.md", knowledgeID)
+			filePath = filepath.Join(knowledgeDir, filename)
+
+			// 检查文件是否存在
+			if _, err := os.Stat(filePath); os.IsNotExist(err) {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						&mcp.TextContent{Text: fmt.Sprintf("知识不存在: %s，请检查 knowledge_id 是否正确", knowledgeID)},
+					},
+					IsError: true,
+				}, nil, nil
+			}
+
+			// 读取原文件获取创建时间
+			oldContent, err := os.ReadFile(filePath)
+			if err == nil {
+				contentStr := string(oldContent)
+				if idx := strings.Index(contentStr, "**创建时间**: "); idx >= 0 {
+					start := idx + len("**创建时间**: ")
+					if end := strings.Index(contentStr[start:], "\n"); end >= 0 {
+						createdTime = strings.TrimSpace(contentStr[start : start+end])
+					}
+				}
+			}
+			if createdTime == "" {
+				createdTime = time.Now().Format(time.RFC3339)
+			}
+
+			isUpdate = true
+			logger.Info("使用提供的知识ID进行更新: %s", knowledgeID)
+		} else {
+			// 创建新的知识ID
+			knowledgeID = uuid.New().String()
+			filename := fmt.Sprintf("%s.md", knowledgeID)
+			filePath = filepath.Join(knowledgeDir, filename)
+			createdTime = time.Now().Format(time.RFC3339)
+			logger.Info("创建新的知识ID: %s", knowledgeID)
+		}
+
+		// 设置默认分类
+		category := args.Category
+		if category == "" {
+			category = "通用"
+		}
+
+		// 构建标签字符串
+		tagsStr := ""
+		if len(args.Tags) > 0 {
+			tagsStr = strings.Join(args.Tags, ", ")
+		}
+
+		// 构建文件内容
+		var content strings.Builder
+		content.WriteString("# " + args.Title + "\n\n")
+		content.WriteString(fmt.Sprintf("**知识ID**: `%s`\n\n", knowledgeID))
+		content.WriteString(fmt.Sprintf("**创建时间**: %s\n\n", createdTime))
+		if isUpdate {
+			content.WriteString(fmt.Sprintf("**更新时间**: %s\n\n", time.Now().Format(time.RFC3339)))
+		}
+		content.WriteString(fmt.Sprintf("**分类**: %s\n\n", category))
+		if tagsStr != "" {
+			content.WriteString(fmt.Sprintf("**标签**: %s\n\n", tagsStr))
+		}
+		content.WriteString("---\n\n")
+		content.WriteString("## 内容\n\n")
+		content.WriteString(args.Content)
+		content.WriteString("\n")
+
+		// 写入文件
+		if err := os.WriteFile(filePath, []byte(content.String()), 0644); err != nil {
+			logger.Error("写入知识文件失败: %v", err)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("保存知识失败: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		// 构建返回消息
+		var actionText string
+		if isUpdate {
+			actionText = "✅ 知识已更新"
+		} else {
+			actionText = "✅ 知识已保存"
+		}
+
+		logger.Info("知识已保存到: %s", filePath)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("%s\n\n**知识ID**: `%s`\n**标题**: %s\n**分类**: %s\n**标签**: %s\n**文件路径**: `%s`\n\n💡 使用 `search_knowledge` 工具可以检索知识库。如需更新此知识，请在下次调用时传入 knowledge_id。", actionText, knowledgeID, args.Title, category, tagsStr, filePath)},
+			},
+		}, nil, nil
+	})
+
+	// 注册 search_knowledge 工具：检索知识库
+	type searchKnowledgeArgs struct {
+		Query    string   `json:"query,omitempty" jsonschema:"搜索关键词，在标题和内容中搜索"`
+		Tags     []string `json:"tags,omitempty" jsonschema:"按标签过滤"`
+		Category string   `json:"category,omitempty" jsonschema:"按分类过滤"`
+		Limit    int      `json:"limit,omitempty" jsonschema:"返回结果数量限制，默认10"`
+		WorkDir  string   `json:"work_dir" jsonschema:"工作目录，知识库位于该目录下的 .knowledge 文件夹中"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search_knowledge",
+		Description: "检索知识库。支持按关键词搜索、按标签过滤、按分类过滤。如果不提供搜索条件，则列出所有知识条目。知识库位于工作目录的 .knowledge 文件夹中。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args searchKnowledgeArgs) (*mcp.CallToolResult, any, error) {
+		// 获取工具执行权限，确保工具串行执行
+		acquireToolSemaphore()
+		defer releaseToolSemaphore()
+
+		logger.Info("=== 检索知识库 ===")
+		logger.Info("查询: %s, 标签: %v, 分类: %s, 工作目录: %s", args.Query, args.Tags, args.Category, args.WorkDir)
+
+		if args.WorkDir == "" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "参数错误：work_dir 不能为空，请提供工作目录路径"},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		// 使用工作目录下的 .knowledge 文件夹
+		knowledgeDir := filepath.Join(args.WorkDir, ".knowledge")
+
+		// 检查目录是否存在
+		if _, err := os.Stat(knowledgeDir); os.IsNotExist(err) {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "知识库为空，尚未保存任何知识。使用 `save_knowledge` 工具添加知识。"},
+				},
+			}, nil, nil
+		}
+
+		// 读取所有知识文件
+		files, err := os.ReadDir(knowledgeDir)
+		if err != nil {
+			logger.Error("读取知识目录失败: %v", err)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("检索知识库失败: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		if len(files) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "知识库为空，尚未保存任何知识。使用 `save_knowledge` 工具添加知识。"},
+				},
+			}, nil, nil
+		}
+
+		// 设置默认限制
+		limit := args.Limit
+		if limit <= 0 {
+			limit = 10
+		}
+
+		// 准备搜索条件
+		queryLower := strings.ToLower(args.Query)
+		categoryLower := strings.ToLower(args.Category)
+		var tagsLower []string
+		for _, tag := range args.Tags {
+			tagsLower = append(tagsLower, strings.ToLower(tag))
+		}
+
+		type KnowledgeItem struct {
+			ID       string
+			Title    string
+			Category string
+			Tags     string
+			FilePath string
+			Preview  string
+		}
+
+		var results []KnowledgeItem
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".md") {
+				continue
+			}
+
+			filePath := filepath.Join(knowledgeDir, file.Name())
+			content, err := os.ReadFile(filePath)
+			if err != nil {
+				continue
+			}
+
+			contentStr := string(content)
+			contentLower := strings.ToLower(contentStr)
+
+			// 解析知识文件
+			var title, category, tags, knowledgeID, preview string
+
+			// 提取标题
+			if idx := strings.Index(contentStr, "\n"); idx > 0 {
+				titleLine := strings.TrimPrefix(contentStr[:idx], "# ")
+				title = strings.TrimSpace(titleLine)
+			}
+
+			// 提取知识ID
+			if idx := strings.Index(contentStr, "**知识ID**: `"); idx >= 0 {
+				start := idx + len("**知识ID**: `")
+				if end := strings.Index(contentStr[start:], "`"); end >= 0 {
+					knowledgeID = contentStr[start : start+end]
+				}
+			}
+
+			// 提取分类
+			if idx := strings.Index(contentStr, "**分类**: "); idx >= 0 {
+				start := idx + len("**分类**: ")
+				if end := strings.Index(contentStr[start:], "\n"); end >= 0 {
+					category = strings.TrimSpace(contentStr[start : start+end])
+				}
+			}
+
+			// 提取标签
+			if idx := strings.Index(contentStr, "**标签**: "); idx >= 0 {
+				start := idx + len("**标签**: ")
+				if end := strings.Index(contentStr[start:], "\n"); end >= 0 {
+					tags = strings.TrimSpace(contentStr[start : start+end])
+				}
+			}
+
+			// 提取预览（内容部分的前200字符）
+			if idx := strings.Index(contentStr, "## 内容\n\n"); idx >= 0 {
+				previewStart := idx + len("## 内容\n\n")
+				previewContent := contentStr[previewStart:]
+				if len(previewContent) > 200 {
+					preview = previewContent[:200] + "..."
+				} else {
+					preview = previewContent
+				}
+			}
+
+			// 应用过滤条件
+			match := true
+
+			// 关键词搜索
+			if queryLower != "" {
+				if !strings.Contains(contentLower, queryLower) {
+					match = false
+				}
+			}
+
+			// 分类过滤
+			if categoryLower != "" && match {
+				if !strings.Contains(strings.ToLower(category), categoryLower) {
+					match = false
+				}
+			}
+
+			// 标签过滤
+			if len(tagsLower) > 0 && match {
+				tagsLowerStr := strings.ToLower(tags)
+				tagMatch := false
+				for _, tag := range tagsLower {
+					if strings.Contains(tagsLowerStr, tag) {
+						tagMatch = true
+						break
+					}
+				}
+				if !tagMatch {
+					match = false
+				}
+			}
+
+			if match {
+				results = append(results, KnowledgeItem{
+					ID:       knowledgeID,
+					Title:    title,
+					Category: category,
+					Tags:     tags,
+					FilePath: filePath,
+					Preview:  preview,
+				})
+			}
+
+			if len(results) >= limit {
+				break
+			}
+		}
+
+		if len(results) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "未找到匹配的知识条目。"},
+				},
+			}, nil, nil
+		}
+
+		// 构建返回结果
+		var resultBuilder strings.Builder
+		resultBuilder.WriteString(fmt.Sprintf("✅ 找到 %d 条知识\n\n", len(results)))
+
+		for i, item := range results {
+			resultBuilder.WriteString(fmt.Sprintf("### %d. %s\n\n", i+1, item.Title))
+			resultBuilder.WriteString(fmt.Sprintf("- **知识ID**: `%s`\n", item.ID))
+			resultBuilder.WriteString(fmt.Sprintf("- **分类**: %s\n", item.Category))
+			if item.Tags != "" {
+				resultBuilder.WriteString(fmt.Sprintf("- **标签**: %s\n", item.Tags))
+			}
+			resultBuilder.WriteString(fmt.Sprintf("- **文件**: `%s`\n", item.FilePath))
+			resultBuilder.WriteString(fmt.Sprintf("\n**预览**:\n%s\n\n", item.Preview))
+			resultBuilder.WriteString("---\n\n")
+		}
+
+		resultBuilder.WriteString("💡 使用文件读取工具可以查看完整知识内容。")
+
+		logger.Info("检索完成，找到 %d 条知识", len(results))
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: resultBuilder.String()},
+			},
+		}, nil, nil
+	})
 }
 
 // truncateString 截断字符串到指定长度
