@@ -489,10 +489,11 @@ func RegisterTools(server *mcp.Server) {
 	type saveMemoryArgs struct {
 		SystemPrompt string `json:"system_prompt" jsonschema:"你的系统提示词完整内容，将被保存到记忆文件中以便恢复时使用"`
 		Content      string `json:"content" jsonschema:"要保存的记忆内容，包括当前任务、调试进度、关键发现、待办事项等"`
+		MemoryID     string `json:"memory_id,omitempty" jsonschema:"记忆ID（可选），如果不提供则新建，如果提供则更新对应记忆文件"`
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "save_memory",
-		Description: "保存记忆到文件。你需要将自己的系统提示词（system prompt）完整写入 system_prompt 参数，记忆内容写入 content 参数。文件使用UUID命名存储在mems文件夹中。每个关键步骤后调用此工具保存进度，返回的文件路径应该被记住以便后续读取。",
+		Description: "保存记忆到文件。你需要将自己的系统提示词（system prompt）完整写入 system_prompt 参数，记忆内容写入 content 参数。如果提供memory_id则更新现有记忆，否则创建新记忆。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args saveMemoryArgs) (*mcp.CallToolResult, any, error) {
 		// 获取工具执行权限，确保工具串行执行
 		acquireToolSemaphore()
@@ -543,16 +544,36 @@ func RegisterTools(server *mcp.Server) {
 			}, nil, nil
 		}
 
-		// 生成UUID作为文件名
-		memoryID := uuid.New().String()
-		filename := fmt.Sprintf("%s.md", memoryID)
-		filePath := filepath.Join(memsDir, filename)
+		// 确定记忆ID和文件路径
+		var memoryID string
+		var filePath string
+		isUpdate := false
+
+		if args.MemoryID != "" {
+			// 使用提供的记忆ID（更新模式）
+			memoryID = args.MemoryID
+			filename := fmt.Sprintf("%s.md", memoryID)
+			filePath = filepath.Join(memsDir, filename)
+			isUpdate = true
+			logger.Info("使用提供的记忆ID进行更新: %s", memoryID)
+		} else {
+			// 创建新的记忆ID
+			memoryID = uuid.New().String()
+			filename := fmt.Sprintf("%s.md", memoryID)
+			filePath = filepath.Join(memsDir, filename)
+			logger.Info("创建新的记忆ID: %s", memoryID)
+		}
 
 		// 构建文件内容（包含提示词和记忆内容）
 		var content strings.Builder
 		content.WriteString("# 记忆文件\n\n")
 		content.WriteString(fmt.Sprintf("**记忆ID**: `%s`\n\n", memoryID))
 		content.WriteString(fmt.Sprintf("**保存时间**: %s\n\n", time.Now().Format(time.RFC3339)))
+		if isUpdate {
+			content.WriteString("**操作**: 更新现有记忆\n\n")
+		} else {
+			content.WriteString("**操作**: 创建新记忆\n\n")
+		}
 		content.WriteString("---\n\n")
 		content.WriteString("## 系统提示词\n\n")
 		content.WriteString("```markdown\n")
@@ -575,10 +596,92 @@ func RegisterTools(server *mcp.Server) {
 			}, nil, nil
 		}
 
+		// 构建返回消息
+		var actionText string
+		if isUpdate {
+			actionText = "✅ 记忆已更新"
+		} else {
+			actionText = "✅ 记忆已保存"
+		}
+
 		logger.Info("记忆已保存到: %s", filePath)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("✅ 记忆已保存\n\n**记忆ID**: `%s`\n**文件路径**: `%s`\n**记忆内容长度**: %d 字符\n**系统提示词长度**: %d 字符\n\n⚠️ **请记住此文件路径**，如果上下文被截断，使用 Read 工具读取此文件即可恢复完整状态。", memoryID, filePath, len(args.Content), len(args.SystemPrompt))},
+				&mcp.TextContent{Text: fmt.Sprintf("%s\n\n**记忆ID**: `%s`\n**文件路径**: `%s`\n**记忆内容长度**: %d 字符\n**系统提示词长度**: %d 字符\n\n⚠️ **请记住此记忆ID**，如果上下文被截断，使用 Read 工具读取此文件即可恢复完整状态。\n\n💡 **提示**: Agent可以在后续调用中传入此memory_id来更新记忆。", actionText, memoryID, filePath, len(args.Content), len(args.SystemPrompt))},
+			},
+		}, nil, nil
+	})
+
+	// 注册 read_memory 工具：根据ID读取记忆文件
+	type readMemoryArgs struct {
+		MemoryID string `json:"memory_id" jsonschema:"记忆ID，必须提供才能读取对应的记忆文件"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "read_memory",
+		Description: "根据记忆ID读取记忆文件内容。必须提供memory_id参数。返回记忆文件中的系统提示词和任务记忆。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args readMemoryArgs) (*mcp.CallToolResult, any, error) {
+		// 获取工具执行权限，确保工具串行执行
+		acquireToolSemaphore()
+		defer releaseToolSemaphore()
+
+		logger.Info("=== 读取记忆 ===")
+
+		// 检查记忆ID参数
+		if args.MemoryID == "" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "参数错误：必须提供memory_id参数"},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		memoryID := args.MemoryID
+
+		// 获取可执行文件所在目录
+		execPath, err := os.Executable()
+		if err != nil {
+			logger.Error("获取可执行文件路径失败: %v", err)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("读取记忆失败: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+		execDir := filepath.Dir(execPath)
+		memsDir := filepath.Join(execDir, "mems")
+
+		// 构建文件路径
+		filename := fmt.Sprintf("%s.md", memoryID)
+		filePath := filepath.Join(memsDir, filename)
+
+		// 检查文件是否存在
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("记忆文件不存在: %s", filePath)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		// 读取文件内容
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			logger.Error("读取记忆文件失败: %v", err)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("读取记忆失败: %v", err)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		logger.Info("成功读取记忆文件: %s", filePath)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("✅ 记忆读取成功\n\n**记忆ID**: `%s`\n**文件路径**: `%s`\n**文件大小**: %d 字符\n\n---\n\n%s", memoryID, filePath, len(content), string(content))},
 			},
 		}, nil, nil
 	})
