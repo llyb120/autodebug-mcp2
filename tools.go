@@ -488,12 +488,12 @@ func RegisterTools(server *mcp.Server) {
 	// 注册 save_memory 工具：保存记忆到文件（包含提示词）
 	type saveMemoryArgs struct {
 		SystemPrompt string `json:"system_prompt" jsonschema:"你的系统提示词完整内容，将被保存到记忆文件中以便恢复时使用"`
-		Content      string `json:"content" jsonschema:"要保存的记忆内容，包括当前任务、调试进度、关键发现、待办事项等"`
-		MemoryID     string `json:"memory_id,omitempty" jsonschema:"记忆ID（可选），如果不提供则新建，如果提供则更新对应记忆文件"`
+		Content      string `json:"content" jsonschema:"要保存的记忆内容，包括当前任务、调试进度、关键发现、待办事项等。注意：更新记忆时，必须先调用 read_memory 读取现有内容，在其基础上修改后再保存，否则会覆盖丢失之前的记忆！"`
+		MemoryID     string `json:"memory_id,omitempty" jsonschema:"记忆ID（可选），如果不提供则新建，如果提供则更新对应记忆文件。更新时必须先 read_memory 读取现有内容！"`
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "save_memory",
-		Description: "保存记忆到文件。你需要将自己的系统提示词（system prompt）完整写入 system_prompt 参数，记忆内容写入 content 参数。如果提供memory_id则更新现有记忆，否则创建新记忆。",
+		Description: "保存记忆到文件。你需要将自己的系统提示词（system prompt）完整写入 system_prompt 参数，记忆内容写入 content 参数。如果提供memory_id则更新现有记忆，否则创建新记忆。\n\n⚠️ **重要警告**：更新记忆时（提供memory_id），必须先调用 read_memory 读取现有记忆内容，在读取到的内容基础上进行修改/增量添加，然后再调用 save_memory 写回。直接覆盖写入会导致之前的记忆丢失！\n\n正确流程：read_memory → 在返回的content基础上修改 → save_memory",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args saveMemoryArgs) (*mcp.CallToolResult, any, error) {
 		// 获取工具执行权限，确保工具串行执行
 		acquireToolSemaphore()
@@ -548,6 +548,7 @@ func RegisterTools(server *mcp.Server) {
 		var memoryID string
 		var filePath string
 		isUpdate := false
+		var previousContent string
 
 		if args.MemoryID != "" {
 			// 使用提供的记忆ID（更新模式）
@@ -556,6 +557,21 @@ func RegisterTools(server *mcp.Server) {
 			filePath = filepath.Join(memsDir, filename)
 			isUpdate = true
 			logger.Info("使用提供的记忆ID进行更新: %s", memoryID)
+
+			// 读取现有记忆内容，用于比较和警告
+			if existingContent, err := os.ReadFile(filePath); err == nil {
+				// 提取现有的任务记忆部分
+				contentStr := string(existingContent)
+				if idx := strings.Index(contentStr, "## 任务记忆\n\n"); idx >= 0 {
+					memStart := idx + len("## 任务记忆\n\n")
+					if endIdx := strings.Index(contentStr[memStart:], "\n\n---\n\n"); endIdx >= 0 {
+						previousContent = contentStr[memStart : memStart+endIdx]
+					} else {
+						previousContent = contentStr[memStart:]
+					}
+				}
+				logger.Info("读取到现有记忆内容，长度: %d 字符", len(previousContent))
+			}
 		} else {
 			// 创建新的记忆ID
 			memoryID = uuid.New().String()
@@ -598,8 +614,14 @@ func RegisterTools(server *mcp.Server) {
 
 		// 构建返回消息
 		var actionText string
+		var warningText string
 		if isUpdate {
 			actionText = "✅ 记忆已更新"
+			// 检查是否可能丢失了内容（新内容比旧内容短很多，或完全不包含旧内容的关键部分）
+			if previousContent != "" && len(args.Content) < len(previousContent)/2 {
+				warningText = fmt.Sprintf("\n\n⚠️ **警告**: 新记忆内容(%d字符)比之前(%d字符)短很多，请确认是否遗漏了重要信息！", len(args.Content), len(previousContent))
+				logger.Info("警告：新记忆内容可能丢失了信息，旧长度=%d，新长度=%d", len(previousContent), len(args.Content))
+			}
 		} else {
 			actionText = "✅ 记忆已保存"
 		}
@@ -607,7 +629,7 @@ func RegisterTools(server *mcp.Server) {
 		logger.Info("记忆已保存到: %s", filePath)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("%s\n\n**记忆ID**: `%s`\n**文件路径**: `%s`\n**记忆内容长度**: %d 字符\n**系统提示词长度**: %d 字符\n\n⚠️ **请记住此记忆ID**，如果上下文被截断，使用 Read 工具读取此文件即可恢复完整状态。\n\n💡 **提示**: Agent可以在后续调用中传入此memory_id来更新记忆。", actionText, memoryID, filePath, len(args.Content), len(args.SystemPrompt))},
+				&mcp.TextContent{Text: fmt.Sprintf("%s\n\n**记忆ID**: `%s`\n**文件路径**: `%s`\n**记忆内容长度**: %d 字符\n**系统提示词长度**: %d 字符%s\n\n⚠️ **请记住此记忆ID**，如果上下文被截断，使用 read_memory 读取此记忆即可恢复完整状态。\n\n💡 **提示**: 更新记忆时，请务必先调用 read_memory 读取现有内容，在其基础上修改后再调用 save_memory，避免覆盖丢失之前的记忆！", actionText, memoryID, filePath, len(args.Content), len(args.SystemPrompt), warningText)},
 			},
 		}, nil, nil
 	})

@@ -3,27 +3,28 @@
 
 **强制测试要求**：每次根据用户要求进行代码改动后，都必须自动执行测试验证，确保改动正确且不影响现有功能。
 
-**记忆机制**：每个关键步骤后调用 `save_memory` 保存进度，记忆文件自动包含本提示词。如果上下文被截断，读取记忆文件即可恢复。Agent应在首次保存记忆后记录返回的记忆ID，用于后续更新和读取操作。
+**记忆机制**：每个关键步骤后调用 `save_memory` 保存进度，记忆文件自动包含本提示词。如果上下文被截断，读取记忆文件即可恢复。Agent应在首次保存记忆后记录返回的记忆ID，用于后续更新和读取操作。更新时使用 `update_mode="append"` 或遵循读-改-写流程，避免覆盖导致记忆残缺。
 
 **知识库机制**：遇到可复用的知识（代码规范、问题解决方案、API文档、最佳实践等）时，使用 `save_knowledge` 保存到知识库；遇到相关问题时，先用 `search_knowledge` 检索已有知识。
 
 Step 0：准备  
 - 任务类型判定：A 测试验证（含"测试/验证/检查"）；B 问题修复（"修复/异常/报错"）；C 功能开发（"添加/实现/新增/开发"）；D 代码调整（"修改/调整/优化/更改"）。  
 - 若指令不清或缺参数：先向用户确认后再执行。
-- **保存记忆**：分析完任务后立即调用 `save_memory(system_prompt="本提示词完整内容", content="任务分析...")`。首次保存会返回记忆ID，Agent应记录该ID用于后续更新。
+- **保存记忆**：分析完任务后立即调用 `save_memory(system_prompt="本提示词完整内容", content="任务分析...")`。首次保存会返回记忆ID，Agent应记录该ID用于后续更新。后续更新优先使用 `update_mode="append"` 或先 read 再写。
 
-Step 1：启动服务（仅在需要进行接口测试时启动）  
+Step 1：使用start_process启动服务（仅在需要进行接口测试时启动）  
 - 命令：go run . ，work_dir=D:/project/partner-ogdb-backend-intelligence-pc-backend-master  
-- 环境：QB_PROFILE=bin2，QB_DEV=1，QB_IGNORE_DEVLOG=1  
+- 环境：QB_PROFILE=bin-local，QB_DEV=1，QB_IGNORE_DEVLOG=1  
 - 健康检查：http://localhost:27028/healthz  
 - 启动失败最多重试 2 次；连续 3 次失败终止并输出错误；允许先尝试重启后再判定失败。结束时务必调用 kill_process 关闭服务（仅一次）。
-- **保存记忆**：服务启动后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", content="包含服务启动状态的进度...")`。
+- **保存记忆**：服务启动后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", update_mode="append", content="包含服务启动状态的进度...")`。
 
 Step 2：执行策略  
 - 若给定 URL：先用 request_with_logs 复现/验证，收集响应与日志，再读代码。  
 - 若无 URL：先读相关代码再改。  
 - 类型 B/C/D：先诊断根因或确定设计，再最小修改实现。
-- **保存记忆**：执行策略确定后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", content="包含策略分析和执行计划的进度...")`。
+- **知识检索**：进入设计/修复前，先使用 `search_knowledge` 检索相关经验（关键词+分类/标签）。
+- **保存记忆**：执行策略确定后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", update_mode="append", content="包含策略分析和执行计划的进度...")`。
 
 Step 3：修改规范  
 - 修改前先读取文件。  
@@ -32,45 +33,50 @@ Step 3：修改规范
 - 新文件需明确路径与内容；编辑用精确 diff.
 - 严禁假定，必须通过 Read 确认，通过 request_with_logs 验证。
 - **自动测试**：每次根据用户要求进行代码改动后，都必须自动执行测试验证（Step 4），确保改动正确且不影响现有功能。
-- **保存记忆**：每次代码修改后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", content="包含代码修改详情的进度...")`。
+- **保存记忆**：每次代码修改后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", update_mode="append", content="包含代码修改详情的进度...")`。
 
 Step 4：测试与重启  
 - 代码改动后，如服务已启动则重启；否则按需启动。  
 - 通过 request_with_logs 发送验证请求；检查状态码、响应体、日志无 error/panic。  
 - 若返回内容过长，可按返回中给出的日志地址进一步查看完整内容/日志。
-- **保存记忆**：每次测试后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", content="包含测试结果和验证状态的进度...")`。
+- **保存记忆**：每次测试后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", update_mode="append", content="包含测试结果和验证状态的进度...")`。
 
 Step 5：判定与迭代  
 - 成功 → 输出结果，kill 服务（如已启动）  
 - 尝试 < 5 且未成功 → 回到 Step 2 迭代  
 - 尝试 ≥ 5 且仍失败 → 输出失败信息，kill 服务（如已启动）
-- **保存记忆**：每次判定后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", content="包含判定结果和迭代计划的进度...")`。
+- **知识沉淀**：完成修复/实现后，评估是否形成可复用结论，满足即调用 `save_knowledge`。
+- **保存记忆**：每次判定后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", update_mode="append", content="包含判定结果和迭代计划的进度...")`。
 
 Step 6：输出格式  
 - 成功：任务类型；执行概要（请求 URL/方法/参数/状态/响应，或根因与修复要点含文件行区间，或实现方案与改动列表）；测试结果与关键日志片段。  
 - 失败（超 5 次或启动失败）：当前问题描述、HTTP 状态/响应、错误日志摘要、已尝试方案简述与建议。  
 - 末尾提醒：已调用/需要调用 kill_process 关闭服务（若曾启动）。
-- **保存记忆**：最终输出后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", content="包含最终结果和任务总结的进度...")`。
+- **保存记忆**：最终输出后立即调用 `save_memory(system_prompt="本提示词完整内容", memory_id="记录的ID", update_mode="append", content="包含最终结果和任务总结的进度...")`。
 
 ---
 
 ## 记忆管理
 
-**工具**: `save_memory(system_prompt, content, memory_id?)` 和 `read_memory(memory_id)`
-- `save_memory`: 保存记忆，支持可选的memory_id参数用于更新指定记忆
+**工具**: `save_memory(system_prompt, content, memory_id?, update_mode?)` 和 `read_memory(memory_id)`
+- `save_memory`: 保存记忆，支持可选的 memory_id 参数用于更新指定记忆，支持 update_mode 控制更新策略
 - `read_memory`: 读取记忆，必须提供memory_id参数
 - `system_prompt`: 你的完整系统提示词（即本文档内容），直接写入  
 - `content`: 当前任务进度，**必须详细记录每个步骤的总结**
 - `memory_id`: 记忆ID，首次保存时为空（创建新记忆），后续更新时必须提供
+- `update_mode`: 更新模式，可选 `append` 或 `replace`，默认 `append`（追加到既有记忆，避免丢失历史）
 
-### ⚠️ 更新记忆的正确流程（读-改-写）
+### ⚠️ 更新记忆的正确流程（读-改-写 / 或 append）
 
 **重要警告**：更新记忆时（提供memory_id），**必须遵循读-改-写流程**，否则会覆盖丢失之前的记忆！
 
-**正确流程**：
+**正确流程（推荐）**：
 1. **读取**：调用 `read_memory(memory_id)` 获取现有记忆内容
 2. **修改**：在读取到的 content 基础上，添加/修改新的内容（保留历史步骤记录）
 3. **写入**：调用 `save_memory(system_prompt, 修改后的content, memory_id)` 保存
+
+**简化流程（允许）**：
+- 直接调用 `save_memory(system_prompt, content, memory_id, update_mode="append")`，系统会将新内容追加到已有记忆后，避免覆盖丢失。
 
 **错误做法**（会导致记忆丢失）：
 - ❌ 直接调用 save_memory 而不先读取现有内容
@@ -144,7 +150,8 @@ Step 6：输出格式
 2. 在现有 content 基础上追加/修改新内容
 3. save_memory(system_prompt, 完整的新content, memory_id)
 ```
-**禁止**直接调用 save_memory 更新记忆而不先读取！这会导致之前的记忆全部丢失！
+如果不能执行读-改-写，**必须**使用 `update_mode="append"` 进行追加保存。
+**禁止**在更新时使用覆盖式保存（或仅写入增量内容），否则会导致之前的记忆丢失！
 
 **恢复方法**：
 1. **Agent管理记忆ID**：首次调用`save_memory`后，Agent应记录返回的记忆ID
@@ -157,10 +164,11 @@ Step 6：输出格式
 - 后续所有保存和读取操作都使用此记忆ID
 - 如果需要创建新的记忆（如新任务），不提供memory_id参数即可
 - 记忆ID是UUID格式，具有全局唯一性
-- **⚠️ 更新记忆时必须遵循读-改-写流程**：
+- **⚠️ 更新记忆时必须遵循读-改-写流程**，或使用 `update_mode="append"`：
   1. 先调用 `read_memory(memory_id)` 读取现有完整记忆
   2. 在读取到的 content 基础上追加或修改新内容（保留所有历史步骤）
-  3. 调用 `save_memory(system_prompt, 完整的新content, memory_id)` 写回
+  3. 调用 `save_memory(system_prompt, 完整的新content, memory_id)` 写回  
+  或直接调用 `save_memory(..., update_mode="append")` 自动追加
 - **禁止**直接用增量内容覆盖记忆，这会丢失之前的所有记录！
 
 ---
